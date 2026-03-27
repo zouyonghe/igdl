@@ -17,7 +17,7 @@ jobs:
           - runner: macos-14
             target: aarch64-apple-darwin
             archive_suffix: macos-aarch64
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             archive_suffix: macos-x86_64
 
