@@ -1,10 +1,11 @@
 [package]
 name = "igdl"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+dirs = "6"
 thiserror = "2"
 which = "7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
