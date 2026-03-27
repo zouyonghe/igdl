@@ -1,6 +1,11 @@
 use igdl::browser::Browser;
 use igdl::error::IgdlError;
-use igdl::paths::managed_binary_path_from;
+use igdl::gallerydl::{
+    build_media_download_command, build_media_download_command_with_ytdlp,
+    build_media_extraction_command, parse_gallerydl_media_items, resolve_gallerydl_binary,
+    ExtractedMediaItem,
+};
+use igdl::paths::{managed_binary_path_from, managed_gallerydl_binary_path_from};
 use igdl::ytdlp::{
     build_download_command, download_release_asset, install_managed_ytdlp, parse_downloaded_paths,
     platform_asset_name, resolve_ytdlp_binary,
@@ -105,6 +110,83 @@ fn skips_blank_lines_without_trimming_path_whitespace() {
 }
 
 #[test]
+fn parses_gallerydl_image_file_events() {
+    let stdout = concat!(
+        "[1, \"https://www.instagram.com/p/DWWJVEdgSjW/\", {\"num\": 1}]\n",
+        "[3, \"https://cdn.example.com/post-1.jpg\", {\"extension\": \"jpg\", \"description\": \"Weekend dump\", \"post_shortcode\": \"DWWJVEdgSjW\", \"num\": 1}]\n"
+    );
+
+    let items = parse_gallerydl_media_items(stdout).unwrap();
+
+    assert_eq!(
+        items,
+        vec![ExtractedMediaItem {
+            url: "https://cdn.example.com/post-1.jpg".to_string(),
+            extension: "jpg".to_string(),
+            description: Some("Weekend dump".to_string()),
+            shortcode: "DWWJVEdgSjW".to_string(),
+            index: 1,
+        }]
+    );
+}
+
+#[test]
+fn preserves_gallerydl_carousel_image_order() {
+    let stdout = concat!(
+        "[3, \"https://cdn.example.com/post-1.jpg\", {\"extension\": \"jpg\", \"description\": \"Weekend dump\", \"post_shortcode\": \"DWWJVEdgSjW\", \"num\": 1}]\n",
+        "[3, \"https://cdn.example.com/post-2.jpg\", {\"extension\": \"jpg\", \"description\": \"Weekend dump\", \"post_shortcode\": \"DWWJVEdgSjW\", \"num\": 2}]\n"
+    );
+
+    let items = parse_gallerydl_media_items(stdout).unwrap();
+
+    assert_eq!(
+        items.iter().map(|item| item.index).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.url.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "https://cdn.example.com/post-1.jpg",
+            "https://cdn.example.com/post-2.jpg",
+        ]
+    );
+}
+
+#[test]
+fn parses_gallerydl_json_array_output() {
+    let stdout = r#"[
+  [1, "https://www.instagram.com/p/DWWJVEdgSjW/", {"num": 1}],
+  [3, "https://cdn.example.com/post-1.jpg", {"extension": "jpg", "description": "Weekend dump", "post_shortcode": "DWWJVEdgSjW", "num": 1}],
+  [3, "https://cdn.example.com/post-2.jpg", {"extension": "jpg", "description": "Weekend dump", "post_shortcode": "DWWJVEdgSjW", "num": 2}]
+]"#;
+
+    let items = parse_gallerydl_media_items(stdout).unwrap();
+
+    assert_eq!(
+        items,
+        vec![
+            ExtractedMediaItem {
+                url: "https://cdn.example.com/post-1.jpg".to_string(),
+                extension: "jpg".to_string(),
+                description: Some("Weekend dump".to_string()),
+                shortcode: "DWWJVEdgSjW".to_string(),
+                index: 1,
+            },
+            ExtractedMediaItem {
+                url: "https://cdn.example.com/post-2.jpg".to_string(),
+                extension: "jpg".to_string(),
+                description: Some("Weekend dump".to_string()),
+                shortcode: "DWWJVEdgSjW".to_string(),
+                index: 2,
+            },
+        ]
+    );
+}
+
+#[test]
 fn download_release_asset_respects_client_timeout() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -201,6 +283,129 @@ fn returns_bootstrap_error_when_ytdlp_is_unavailable() {
     }
 }
 
+#[test]
+fn builds_gallerydl_command_with_browser_cookies_and_json_output() {
+    let url = "https://www.instagram.com/p/abc123/";
+    let cmd = build_media_extraction_command(
+        Path::new("/usr/local/bin/gallery-dl"),
+        Browser::Chrome,
+        url,
+    );
+
+    assert_eq!(cmd.get_program(), OsStr::new("/usr/local/bin/gallery-dl"));
+
+    let args: Vec<_> = cmd.get_args().map(|arg| arg.to_os_string()).collect();
+    assert_eq!(
+        args,
+        vec![
+            OsString::from("--cookies-from-browser"),
+            OsString::from("chrome"),
+            OsString::from("-j"),
+            OsString::from(url),
+        ]
+    );
+}
+
+#[test]
+fn builds_gallerydl_download_command_with_ytdlp_directory_on_path() {
+    let ytdlp_dir = tempdir().unwrap();
+    let ytdlp_path = ytdlp_dir.path().join("yt-dlp");
+    std::fs::write(&ytdlp_path, b"").unwrap();
+
+    let cmd = build_media_download_command_with_ytdlp(
+        Path::new("/usr/local/bin/gallery-dl"),
+        Browser::Edge,
+        "https://www.instagram.com/p/abc123/",
+        Path::new("/tmp/instagram/.igdl-gallerydl-download"),
+        Some(&ytdlp_path),
+    );
+
+    let path_env = cmd
+        .get_envs()
+        .find(|(key, _)| *key == OsStr::new("PATH"))
+        .and_then(|(_, value)| value)
+        .expect("PATH should be set for gallery-dl command");
+
+    let path_entries = std::env::split_paths(path_env).collect::<Vec<_>>();
+    assert_eq!(path_entries.first(), Some(&ytdlp_dir.path().to_path_buf()));
+}
+
+#[test]
+fn builds_gallerydl_download_command_with_temp_dir_and_filename_template() {
+    let url = "https://www.instagram.com/p/abc123/";
+    let cmd = build_media_download_command(
+        Path::new("/usr/local/bin/gallery-dl"),
+        Browser::Edge,
+        url,
+        Path::new("/tmp/instagram/.igdl-gallerydl-download"),
+    );
+
+    assert_eq!(cmd.get_program(), OsStr::new("/usr/local/bin/gallery-dl"));
+
+    let args: Vec<_> = cmd.get_args().map(|arg| arg.to_os_string()).collect();
+    assert_eq!(
+        args,
+        vec![
+            OsString::from("--cookies-from-browser"),
+            OsString::from("edge"),
+            OsString::from("-D"),
+            OsString::from("/tmp/instagram/.igdl-gallerydl-download"),
+            OsString::from("-f"),
+            OsString::from("{post_shortcode}_{num:>02}.{extension}"),
+            OsString::from(url),
+        ]
+    );
+}
+
+#[test]
+fn resolves_gallerydl_from_path_before_managed_cache() {
+    let _lock = PATH_LOCK.lock().unwrap();
+    let home = tempdir().unwrap();
+    let bin_dir = tempdir().unwrap();
+    let path_binary = bin_dir.path().join(gallerydl_binary_name());
+    let managed_binary = managed_gallerydl_binary_path_from(home.path());
+
+    write_executable(&path_binary);
+    write_executable(&managed_binary);
+
+    let _guard = PathGuard::set(bin_dir.path());
+    let resolved = resolve_gallerydl_binary(home.path()).unwrap();
+
+    assert_eq!(resolved, path_binary);
+}
+
+#[test]
+fn uses_gallerydl_managed_cache_when_path_lookup_misses() {
+    let _lock = PATH_LOCK.lock().unwrap();
+    let home = tempdir().unwrap();
+    let empty_path = tempdir().unwrap();
+    let managed_binary = managed_gallerydl_binary_path_from(home.path());
+
+    write_executable(&managed_binary);
+
+    let _guard = PathGuard::set(empty_path.path());
+    let resolved = resolve_gallerydl_binary(home.path()).unwrap();
+
+    assert_eq!(resolved, managed_binary);
+}
+
+#[test]
+fn returns_bootstrap_error_when_gallerydl_is_unavailable() {
+    let _lock = PATH_LOCK.lock().unwrap();
+    let home = tempdir().unwrap();
+    let empty_path = tempdir().unwrap();
+    let _guard = PathGuard::set(empty_path.path());
+
+    let err = resolve_gallerydl_binary(home.path()).unwrap_err();
+
+    match err {
+        IgdlError::GalleryDlBootstrap(message) => {
+            assert_eq!(message, "gallery-dl not found on PATH or managed cache")
+        }
+        other => panic!("expected bootstrap error, got {other:?}"),
+    }
+}
+
 fn write_executable(path: &Path) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, b"").unwrap();
@@ -210,6 +415,14 @@ fn write_executable(path: &Path) {
         let mut permissions = std::fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+}
+
+fn gallerydl_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "gallery-dl.exe"
+    } else {
+        "gallery-dl"
     }
 }
 

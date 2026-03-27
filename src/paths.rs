@@ -15,6 +15,24 @@ pub fn managed_binary_path_from(home: &Path) -> PathBuf {
     )
 }
 
+pub fn managed_gallerydl_binary_path_from(home: &Path) -> PathBuf {
+    managed_gallerydl_binary_path_for(
+        std::env::consts::OS,
+        dirs::cache_dir().as_deref(),
+        dirs::home_dir().as_deref(),
+        home,
+    )
+}
+
+pub fn managed_gallerydl_venv_dir_from(home: &Path) -> PathBuf {
+    managed_gallerydl_venv_dir_for(
+        std::env::consts::OS,
+        dirs::cache_dir().as_deref(),
+        dirs::home_dir().as_deref(),
+        home,
+    )
+}
+
 /// Resolves the output directory and creates the chosen directory on disk.
 ///
 /// ```compile_fail
@@ -56,6 +74,30 @@ fn managed_binary_path_for(
     home: &Path,
 ) -> PathBuf {
     default_cache_dir_for(os, native_cache_dir, native_home_dir, home).join("yt-dlp")
+}
+
+fn managed_gallerydl_binary_path_for(
+    os: &str,
+    native_cache_dir: Option<&Path>,
+    native_home_dir: Option<&Path>,
+    home: &Path,
+) -> PathBuf {
+    match os {
+        "windows" => default_cache_dir_for(os, native_cache_dir, native_home_dir, home)
+            .join("gallery-dl.exe"),
+        _ => managed_gallerydl_venv_dir_for(os, native_cache_dir, native_home_dir, home)
+            .join("bin")
+            .join("gallery-dl"),
+    }
+}
+
+fn managed_gallerydl_venv_dir_for(
+    os: &str,
+    native_cache_dir: Option<&Path>,
+    native_home_dir: Option<&Path>,
+    home: &Path,
+) -> PathBuf {
+    default_cache_dir_for(os, native_cache_dir, native_home_dir, home).join("gallery-dl-venv")
 }
 
 fn default_output_dir_for(

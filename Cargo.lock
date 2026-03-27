@@ -568,6 +568,7 @@ dependencies = [
  "clap",
  "dirs",
  "reqwest",
+ "serde_json",
  "tempfile",
  "thiserror",
  "which",
