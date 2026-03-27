@@ -133,14 +133,23 @@ fn download_release_asset_respects_client_timeout() {
 fn uses_library_cache_for_managed_binary() {
     let home = tempdir().unwrap();
     let path = managed_binary_path_from(home.path());
-    assert_eq!(
-        path,
-        home.path()
+    let expected = match std::env::consts::OS {
+        "macos" => home
+            .path()
             .join("Library")
             .join("Caches")
             .join("igdl")
-            .join("yt-dlp")
-    );
+            .join("yt-dlp"),
+        "windows" => home
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("igdl")
+            .join("yt-dlp"),
+        _ => home.path().join(".cache").join("igdl").join("yt-dlp"),
+    };
+
+    assert_eq!(path, expected);
 }
 
 #[test]
