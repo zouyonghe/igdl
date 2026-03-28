@@ -1,9 +1,8 @@
 use igdl::browser::Browser;
 use igdl::error::IgdlError;
 use igdl::gallerydl::{
-    build_media_download_command, build_media_download_command_with_ytdlp,
+    ExtractedMediaItem, build_media_download_command, build_media_download_command_with_ytdlp,
     build_media_extraction_command, parse_gallerydl_media_items, resolve_gallerydl_binary,
-    ExtractedMediaItem,
 };
 use igdl::paths::{managed_binary_path_from, managed_gallerydl_binary_path_from};
 use igdl::ytdlp::{
@@ -56,6 +55,7 @@ fn installs_managed_ytdlp_into_cache_and_marks_it_executable() {
 #[test]
 fn builds_ytdlp_command_with_browser_cookies_and_output_template() {
     let url = "https://www.instagram.com/reel/abc123/";
+    let progress_template = "download:__IGDL_PROGRESS__ percent=%(progress._percent_str)s downloaded_bytes=%(progress.downloaded_bytes)s total_bytes=%(progress.total_bytes)s speed=%(progress.speed)s eta=%(progress.eta)s";
     let cmd = build_download_command(
         Path::new("/usr/local/bin/yt-dlp"),
         Browser::Chrome,
@@ -66,12 +66,22 @@ fn builds_ytdlp_command_with_browser_cookies_and_output_template() {
     assert_eq!(cmd.get_program(), OsStr::new("/usr/local/bin/yt-dlp"));
 
     let args: Vec<_> = cmd.get_args().map(|arg| arg.to_os_string()).collect();
+    let progress_template_arg = args
+        .windows(2)
+        .find(|window| window[0].as_os_str() == OsStr::new("--progress-template"))
+        .map(|window| window[1].to_string_lossy().into_owned())
+        .expect("yt-dlp command should include --progress-template");
+
+    assert!(progress_template_arg.contains("__IGDL_PROGRESS__"));
     assert_eq!(
         args,
         vec![
             OsString::from("--cookies-from-browser"),
             OsString::from("chrome"),
-            OsString::from("--no-progress"),
+            OsString::from("--quiet"),
+            OsString::from("--progress"),
+            OsString::from("--progress-template"),
+            OsString::from(progress_template),
             OsString::from("--newline"),
             OsString::from("--print"),
             OsString::from("after_move:filepath"),
@@ -113,7 +123,7 @@ fn skips_blank_lines_without_trimming_path_whitespace() {
 fn parses_gallerydl_image_file_events() {
     let stdout = concat!(
         "[1, \"https://www.instagram.com/p/DWWJVEdgSjW/\", {\"num\": 1}]\n",
-        "[3, \"https://cdn.example.com/post-1.jpg\", {\"extension\": \"jpg\", \"description\": \"Weekend dump\", \"post_shortcode\": \"DWWJVEdgSjW\", \"num\": 1}]\n"
+        "[3, \"https://cdn.example.com/post-1.jpg\", {\"extension\": \"jpg\", \"description\": \"Weekend dump\", \"post_shortcode\": \"DWWJVEdgSjW\", \"num\": 1, \"_http_headers\": {\"User-Agent\": \"Example\"}}]\n"
     );
 
     let items = parse_gallerydl_media_items(stdout).unwrap();
@@ -126,6 +136,7 @@ fn parses_gallerydl_image_file_events() {
             description: Some("Weekend dump".to_string()),
             shortcode: "DWWJVEdgSjW".to_string(),
             index: 1,
+            http_headers: vec![("User-Agent".to_string(), "Example".to_string())],
         }]
     );
 }
@@ -174,6 +185,7 @@ fn parses_gallerydl_json_array_output() {
                 description: Some("Weekend dump".to_string()),
                 shortcode: "DWWJVEdgSjW".to_string(),
                 index: 1,
+                http_headers: Vec::new(),
             },
             ExtractedMediaItem {
                 url: "https://cdn.example.com/post-2.jpg".to_string(),
@@ -181,6 +193,7 @@ fn parses_gallerydl_json_array_output() {
                 description: Some("Weekend dump".to_string()),
                 shortcode: "DWWJVEdgSjW".to_string(),
                 index: 2,
+                http_headers: Vec::new(),
             },
         ]
     );

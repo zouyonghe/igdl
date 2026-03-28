@@ -43,7 +43,7 @@ Useful flags:
 - `--output <dir>` save to a different folder
 - `--verbose` show browser retries and backend details when available
 
-By default, `igdl` prints concise progress while it downloads. Reel downloads show a simple start message, and carousel posts show overall progress like `1/3`, `2/3`, and `3/3` as each item finishes.
+By default, `igdl` prints concise progress while it downloads. Reel downloads now show live video progress, including a dynamic progress bar with percent, speed, and ETA when running in a terminal, and carousel posts still show overall progress like `1/3`, `2/3`, and `3/3` as each item finishes.
 
 ## Default download locations
 

@@ -1,4 +1,4 @@
-use igdl::browser::{browser_attempts, Browser};
+use igdl::browser::{Browser, browser_attempts};
 use igdl::cli::BrowserArg;
 
 #[test]

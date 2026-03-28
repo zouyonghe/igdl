@@ -3,20 +3,22 @@ use crate::error::IgdlError;
 use crate::media::build_media_filename;
 use crate::paths::{managed_gallerydl_binary_path_from, managed_gallerydl_venv_dir_from};
 use crate::ytdlp::download_release_asset;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GALLERYDL_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 const GALLERYDL_DOWNLOAD_FILENAME_TEMPLATE: &str = "{post_shortcode}_{num:>02}.{extension}";
+const IMAGE_DOWNLOAD_CONCURRENCY_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExtractedMediaItem {
@@ -25,6 +27,7 @@ pub struct ExtractedMediaItem {
     pub description: Option<String>,
     pub shortcode: String,
     pub index: usize,
+    pub http_headers: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +45,18 @@ pub struct MediaDownloadRequest<'a> {
 struct MediaDownloadExecution<'a> {
     request: MediaDownloadRequest<'a>,
     temp_dir: &'a Path,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageDownloadProgressUpdate {
+    pub item_id: String,
+    pub label: String,
+    pub percentage: Option<u8>,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub speed_bytes_per_second: Option<u64>,
+    pub eta: Option<Duration>,
+    pub completed: bool,
 }
 
 pub fn resolve_gallerydl_binary(home: &Path) -> Result<PathBuf, IgdlError> {
@@ -172,6 +187,62 @@ where
 
     let result = (|| -> Result<Vec<PathBuf>, IgdlError> {
         let download_result = run_media_download(
+            MediaDownloadExecution {
+                request: MediaDownloadRequest {
+                    items: &ordered,
+                    ..request
+                },
+                temp_dir: &temp_dir,
+            },
+            &mut on_progress,
+        );
+        let finalized = finalize_downloaded_media_files(&temp_dir, request.output_dir, &ordered)?;
+
+        resolve_media_download_result(download_result, finalized)
+    })();
+
+    let cleanup_result = cleanup_temp_media_download_dir(&temp_dir);
+
+    match (result, cleanup_result) {
+        (Ok(paths), Ok(())) => Ok(paths),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(_)) => Err(err),
+    }
+}
+
+pub fn download_image_items_with_progress<F>(
+    request: MediaDownloadRequest<'_>,
+    mut on_progress: F,
+) -> Result<Vec<PathBuf>, IgdlError>
+where
+    F: FnMut(usize, usize),
+{
+    let total = request.items.len();
+    let mut completed = HashSet::new();
+
+    download_image_items_with_detailed_progress(request, |update| {
+        if update.completed && completed.insert(update.item_id.clone()) {
+            on_progress(completed.len(), total);
+        }
+    })
+}
+
+pub fn download_image_items_with_detailed_progress<F>(
+    request: MediaDownloadRequest<'_>,
+    mut on_progress: F,
+) -> Result<Vec<PathBuf>, IgdlError>
+where
+    F: FnMut(ImageDownloadProgressUpdate),
+{
+    let mut ordered = request.items.to_vec();
+    ordered.sort_by_key(|item| item.index);
+
+    let temp_dir = temp_media_download_dir(request.output_dir);
+    reset_temp_media_download_dir(&temp_dir)?;
+
+    let result = (|| -> Result<Vec<PathBuf>, IgdlError> {
+        let download_result = run_image_download(
             MediaDownloadExecution {
                 request: MediaDownloadRequest {
                     items: &ordered,
@@ -490,6 +561,279 @@ fn run_media_download(
     )))
 }
 
+fn run_image_download(
+    execution: MediaDownloadExecution<'_>,
+    on_progress: &mut dyn FnMut(ImageDownloadProgressUpdate),
+) -> Result<(), IgdlError> {
+    let request = execution.request;
+    if request.items.is_empty() {
+        return Ok(());
+    }
+
+    let client = Client::builder()
+        .build()
+        .map_err(|err| IgdlError::MediaDownload(format!("failed to create image client: {err}")))?;
+    let queue = Arc::new(Mutex::new(VecDeque::from(request.items.to_vec())));
+    let temp_dir = execution.temp_dir.to_path_buf();
+    let use_index = request.items.len() > 1;
+    let worker_count = request.items.len().min(IMAGE_DOWNLOAD_CONCURRENCY_LIMIT);
+    let (sender, receiver) = mpsc::channel();
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let client = client.clone();
+        let queue = Arc::clone(&queue);
+        let sender = sender.clone();
+        let temp_dir = temp_dir.clone();
+        workers.push(std::thread::spawn(move || {
+            while let Some(item) = next_image_download_item(&queue) {
+                if let Err(message) =
+                    download_single_image_item(&client, &temp_dir, &item, use_index, &sender)
+                    && sender
+                        .send(ImageDownloadWorkerMessage::Failure(message))
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(sender);
+
+    let mut failures = Vec::new();
+    for message in receiver {
+        match message {
+            ImageDownloadWorkerMessage::Progress(update) => on_progress(update),
+            ImageDownloadWorkerMessage::Failure(message) => failures.push(message),
+        }
+    }
+
+    for worker in workers {
+        if worker.join().is_err() {
+            failures.push("image download worker panicked".to_owned());
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(IgdlError::MediaDownload(failures.join("; ")))
+    }
+}
+
+enum ImageDownloadWorkerMessage {
+    Progress(ImageDownloadProgressUpdate),
+    Failure(String),
+}
+
+fn next_image_download_item(
+    queue: &Mutex<VecDeque<ExtractedMediaItem>>,
+) -> Option<ExtractedMediaItem> {
+    queue
+        .lock()
+        .expect("image download queue should not be poisoned")
+        .pop_front()
+}
+
+fn download_single_image_item(
+    client: &Client,
+    temp_dir: &Path,
+    item: &ExtractedMediaItem,
+    use_index: bool,
+    sender: &mpsc::Sender<ImageDownloadWorkerMessage>,
+) -> Result<(), String> {
+    let label = image_download_label(item, use_index);
+    let item_id = intermediate_media_filename(item);
+    let final_path = temp_dir.join(&item_id);
+    let temporary_path = temporary_download_path(&final_path);
+
+    let result = (|| -> Result<(), String> {
+        let mut response = image_download_request(client, item)
+            .send()
+            .map_err(|err| format!("failed to download {label}: {err}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!(
+                "failed to download {label}: server returned {status}"
+            ));
+        }
+
+        let total_bytes = response.content_length();
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)
+            .map_err(|err| format!("failed to create temporary file for {label}: {err}"))?;
+        let mut buffer = [0_u8; 16 * 1024];
+        let mut downloaded_bytes = 0_u64;
+        let started_at = Instant::now();
+
+        loop {
+            let bytes_read = response
+                .read(&mut buffer)
+                .map_err(|err| format!("failed to read {label}: {err}"))?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            file.write_all(&buffer[..bytes_read])
+                .map_err(|err| format!("failed to write {label}: {err}"))?;
+            downloaded_bytes += bytes_read as u64;
+            send_image_progress_update(
+                sender,
+                build_image_progress_update(
+                    &item_id,
+                    &label,
+                    downloaded_bytes,
+                    total_bytes,
+                    started_at.elapsed(),
+                    false,
+                ),
+            )?;
+        }
+
+        if let Some(expected_bytes) = total_bytes
+            && downloaded_bytes != expected_bytes
+        {
+            return Err(format!(
+                "failed to download {label}: expected {expected_bytes} bytes, got {downloaded_bytes}"
+            ));
+        }
+
+        file.sync_all()
+            .map_err(|err| format!("failed to flush {label}: {err}"))?;
+        std::fs::rename(&temporary_path, &final_path)
+            .map_err(|err| format!("failed to finalize {label}: {err}"))?;
+        send_image_progress_update(
+            sender,
+            build_image_progress_update(
+                &item_id,
+                &label,
+                downloaded_bytes,
+                total_bytes.or(Some(downloaded_bytes)),
+                started_at.elapsed(),
+                true,
+            ),
+        )?;
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+
+    result
+}
+
+fn send_image_progress_update(
+    sender: &mpsc::Sender<ImageDownloadWorkerMessage>,
+    update: ImageDownloadProgressUpdate,
+) -> Result<(), String> {
+    sender
+        .send(ImageDownloadWorkerMessage::Progress(update))
+        .map_err(|_| "failed to report image progress".to_owned())
+}
+
+fn build_image_progress_update(
+    item_id: &str,
+    label: &str,
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    elapsed: Duration,
+    completed: bool,
+) -> ImageDownloadProgressUpdate {
+    let speed_bytes_per_second = compute_bytes_per_second(downloaded_bytes, elapsed);
+    let eta = if completed {
+        None
+    } else {
+        compute_eta(downloaded_bytes, total_bytes, speed_bytes_per_second)
+    };
+
+    ImageDownloadProgressUpdate {
+        item_id: item_id.to_owned(),
+        label: label.to_owned(),
+        percentage: image_download_percentage(downloaded_bytes, total_bytes, completed),
+        downloaded_bytes,
+        total_bytes,
+        speed_bytes_per_second,
+        eta,
+        completed,
+    }
+}
+
+fn image_download_percentage(
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    completed: bool,
+) -> Option<u8> {
+    if completed {
+        return Some(100);
+    }
+
+    let total_bytes = total_bytes?;
+    if total_bytes == 0 {
+        return None;
+    }
+
+    Some(((downloaded_bytes.saturating_mul(100)) / total_bytes).min(100) as u8)
+}
+
+fn compute_bytes_per_second(downloaded_bytes: u64, elapsed: Duration) -> Option<u64> {
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs <= 0.0 {
+        return None;
+    }
+
+    let bytes_per_second = (downloaded_bytes as f64 / elapsed_secs).round() as u64;
+    (bytes_per_second > 0).then_some(bytes_per_second)
+}
+
+fn compute_eta(
+    downloaded_bytes: u64,
+    total_bytes: Option<u64>,
+    speed_bytes_per_second: Option<u64>,
+) -> Option<Duration> {
+    let total_bytes = total_bytes?;
+    let speed_bytes_per_second = speed_bytes_per_second?;
+    if total_bytes <= downloaded_bytes || speed_bytes_per_second == 0 {
+        return None;
+    }
+
+    let remaining_bytes = total_bytes - downloaded_bytes;
+    let seconds = remaining_bytes.div_ceil(speed_bytes_per_second);
+    Some(Duration::from_secs(seconds))
+}
+
+fn image_download_label(item: &ExtractedMediaItem, use_index: bool) -> String {
+    build_media_filename(
+        item.description.as_deref().unwrap_or("media"),
+        &item.shortcode,
+        use_index.then_some(item.index),
+        &item.extension,
+    )
+}
+
+fn image_download_url(item: &ExtractedMediaItem) -> &str {
+    item.url.strip_prefix("ytdl:").unwrap_or(&item.url)
+}
+
+fn image_download_request(client: &Client, item: &ExtractedMediaItem) -> RequestBuilder {
+    let mut request = client.get(image_download_url(item));
+
+    for (name, value) in &item.http_headers {
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        request = request.header(name, value);
+    }
+
+    request
+}
+
 #[derive(Clone, Copy)]
 enum OutputStream {
     Stdout,
@@ -656,6 +1000,18 @@ fn extract_media_item(event: &Value, fallback_index: usize) -> Option<ExtractedM
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(fallback_index);
+    let http_headers = metadata
+        .get("_http_headers")
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value.as_str().map(|value| (name.clone(), value.to_owned()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     Some(ExtractedMediaItem {
         url,
@@ -663,6 +1019,7 @@ fn extract_media_item(event: &Value, fallback_index: usize) -> Option<ExtractedM
         description,
         shortcode,
         index,
+        http_headers,
     })
 }
 

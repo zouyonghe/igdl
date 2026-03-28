@@ -12,10 +12,10 @@ pub mod ytdlp;
 use clap::Parser;
 
 use crate::cli::CliArgs;
-use crate::download::{execute_download_plan, plan_download, DownloadBinaries};
+use crate::download::{DownloadBinaries, execute_download_plan, plan_download};
 use crate::gallerydl::{bootstrap_managed_gallerydl, resolve_gallerydl_binary};
 use crate::paths::resolve_home_dir;
-use crate::url::{instagram_url_kind, InstagramUrlKind};
+use crate::url::{InstagramUrlKind, instagram_url_kind};
 use crate::ytdlp::{bootstrap_managed_ytdlp, resolve_ytdlp_binary};
 
 pub use error::IgdlError;
