@@ -15,6 +15,7 @@ use igdl::gallerydl::MediaDownloadRequest;
 use igdl::gallerydl::download_image_items_with_detailed_progress;
 use igdl::gallerydl::download_media_items_with_progress;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
@@ -32,16 +33,46 @@ fn capture_cli_output_in_pseudo_tty(
     args: &[&std::ffi::OsStr],
 ) -> std::process::Output {
     let mut command = Command::new("script");
-    command.arg("-q").arg("/dev/null");
-
-    if cfg!(target_os = "linux") {
-        command.arg("--");
-    }
-
-    command.arg(env!("CARGO_BIN_EXE_igdl"));
-    command.args(args);
+    command.args(pseudo_tty_invocation_args(
+        env!("CARGO_BIN_EXE_igdl").as_ref(),
+        args,
+        cfg!(target_os = "linux"),
+    ));
     command.env("PATH", path);
     command.output().unwrap()
+}
+
+#[cfg(unix)]
+fn pseudo_tty_invocation_args(binary: &OsStr, args: &[&OsStr], is_linux: bool) -> Vec<OsString> {
+    if is_linux {
+        return vec![
+            OsString::from("-q"),
+            OsString::from("-e"),
+            OsString::from("-c"),
+            OsString::from(shell_quote_for_script_command(binary, args)),
+            OsString::from("/dev/null"),
+        ];
+    }
+
+    let mut command_args = vec![OsString::from("-q"), OsString::from("/dev/null")];
+    command_args.push(binary.to_os_string());
+    command_args.extend(args.iter().map(|arg| (*arg).to_os_string()));
+    command_args
+}
+
+#[cfg(unix)]
+fn shell_quote_for_script_command(binary: &OsStr, args: &[&OsStr]) -> String {
+    std::iter::once(binary)
+        .chain(args.iter().copied())
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &OsStr) -> String {
+    let value = value.to_string_lossy();
+    format!("'{}'", value.replace('\'', r#"'\''"#))
 }
 
 #[cfg(unix)]
@@ -354,6 +385,27 @@ fn collect_updates_by_label(
     }
 
     grouped
+}
+
+#[test]
+#[cfg(unix)]
+fn linux_pseudo_tty_invocation_uses_command_flag() {
+    let args = pseudo_tty_invocation_args(
+        OsStr::new("/tmp/igdl"),
+        &[OsStr::new("--browser"), OsStr::new("chrome")],
+        true,
+    );
+
+    assert_eq!(
+        args,
+        vec![
+            OsString::from("-q"),
+            OsString::from("-e"),
+            OsString::from("-c"),
+            OsString::from("'/tmp/igdl' '--browser' 'chrome'"),
+            OsString::from("/dev/null"),
+        ]
+    );
 }
 
 #[test]
